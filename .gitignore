@@ -1,0 +1,7 @@
+.reference/
+dist/
+*.log
+.env
+.env.*
+.DS_Store
+/mcp-linux-go
