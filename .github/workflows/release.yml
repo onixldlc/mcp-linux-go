@@ -24,11 +24,24 @@ jobs:
           - { label: "windows-amd64", goos: "windows", goarch: "amd64", out: "mcp-linux-go-windows-amd64.exe" }
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION}"
 
       - name: Build
         env:
@@ -37,7 +50,9 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o dist/${{ matrix.target.out }} .
+          go build -trimpath \
+            -ldflags "-s -w -X main.serverVersion=${{ steps.ver.outputs.version }}" \
+            -o dist/${{ matrix.target.out }} .
 
       - name: Checksum
         run: |

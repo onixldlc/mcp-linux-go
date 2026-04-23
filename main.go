@@ -19,10 +19,11 @@ import (
 	"github.com/onixldlc/mcp-linux-go/internal/validator"
 )
 
-const (
-	serverName    = "mcp-linux-go"
-	serverVersion = "1.0.0"
-)
+const serverName = "mcp-linux-go"
+
+// serverVersion overridden at build time via:
+//   go build -ldflags "-X main.serverVersion=$(git describe --tags --always --dirty)"
+var serverVersion = "dev"
 
 type config struct {
 	host          string
