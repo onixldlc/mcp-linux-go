@@ -25,6 +25,16 @@ const serverName = "mcp-linux-go"
 //   go build -ldflags "-X main.serverVersion=$(git describe --tags --always --dirty)"
 var serverVersion = "dev"
 
+// protocolVersion is the newest MCP revision the pinned go-sdk speaks. The SDK
+// negotiates down automatically for older clients; this is display only.
+// Keep in sync with the go-sdk version in go.mod.
+const protocolVersion = "2026-07-28"
+
+// maxRequestBodyBytes must fit the largest tool payload. upload_file_b64 accepts
+// tools.MaxFileWrite raw bytes, which inflate ~4/3 under base64, plus JSON framing.
+// The SDK default is only 4 MiB, which would reject large uploads outright.
+const maxRequestBodyBytes = int64(tools.MaxFileWrite)*4/3 + 8<<20
+
 type config struct {
 	host          string
 	port          int
@@ -165,7 +175,8 @@ func bootBanner(cfg config, allow validator.AllowList) {
 	cwd, _ := os.Getwd()
 
 	log(fmt.Sprintf("v%s", serverVersion))
-	log(fmt.Sprintf("transport:   http"))
+	log(fmt.Sprintf("transport:   streamable http (stateless)"))
+	log(fmt.Sprintf("protocol:    %s — negotiates down for older clients", protocolVersion))
 	log(fmt.Sprintf("runtime:     %s on %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH))
 	log(fmt.Sprintf("user:        %s@%s", uname, host))
 	log(fmt.Sprintf("pid:         %d", os.Getpid()))
@@ -219,17 +230,34 @@ func main() {
 	}
 
 	server := buildServer(allow)
+	// Stateless is required to serve protocol 2026-07-28 over HTTP: that revision
+	// drops the initialize handshake and session IDs entirely. Without it clients
+	// negotiate down to 2025-11-25. This server has no server->client requests,
+	// subscriptions, sampling, or roots, so nothing depends on session state.
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
 		return server
-	}, nil)
+	}, &mcp.StreamableHTTPOptions{
+		Stateless:           true,
+		MaxRequestBodyBytes: maxRequestBodyBytes,
+	})
+
+	// go-sdk v1.6.0 stopped enabling cross-origin protection by default and
+	// deprecated the option field. Wrap the handler ourselves to keep the
+	// DNS-rebinding/CSRF protection that v1.5.0 applied implicitly.
+	crossOrigin := http.NewCrossOriginProtection()
+
+	protect := func(h http.Handler) http.Handler {
+		return crossOrigin.Handler(bearerAuth(cfg.token, h))
+	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", bearerAuth(cfg.token, mcpHandler))
-	mux.Handle("/mcp/", bearerAuth(cfg.token, mcpHandler))
+	mux.Handle("/mcp", protect(mcpHandler))
+	mux.Handle("/mcp/", protect(mcpHandler))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok": true, "name": serverName, "version": serverVersion,
+			"protocol_version": protocolVersion, "stateless": true,
 		})
 	})
 
@@ -254,19 +282,27 @@ func bearerAuth(token string, next http.Handler) http.Handler {
 		h := r.Header.Get("Authorization")
 		const prefix = "Bearer "
 		if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
-			unauth(w)
+			unauth(w, "")
 			return
 		}
 		got := []byte(h[len(prefix):])
 		if subtle.ConstantTimeCompare(got, expected) != 1 {
-			unauth(w)
+			unauth(w, "invalid_token")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-func unauth(w http.ResponseWriter) {
+// unauth emits an RFC 6750 Bearer challenge alongside the JSON-RPC error. MCP
+// clients key off WWW-Authenticate to tell "needs credentials" apart from a
+// generic failure; a bare 401 body leaves them guessing.
+func unauth(w http.ResponseWriter, errCode string) {
+	challenge := `Bearer realm="` + serverName + `"`
+	if errCode != "" {
+		challenge += `, error="` + errCode + `"`
+	}
+	w.Header().Set("WWW-Authenticate", challenge)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
 	_ = json.NewEncoder(w).Encode(map[string]any{

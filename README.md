@@ -20,6 +20,24 @@ Same request/response shape as upstream, so existing clients work unchanged.
 
 HTTP-only. No stdio transport in this port.
 
+## MCP protocol support
+
+Speaks MCP revision **2026-07-28** (go-sdk v1.7.0), negotiating down to
+`2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05` for older clients.
+
+The server runs in **stateless** mode, which `2026-07-28` requires over HTTP:
+
+- No `initialize` handshake and no `Mcp-Session-Id`. Clients call `server/discover`
+  and carry `_meta` (protocol version, client info, capabilities) on each request.
+- `GET` and `DELETE` on `/mcp` return `405`. There is no resumable event stream.
+- Per SEP-2243, requests must mirror `Mcp-Protocol-Version`, `Mcp-Method`, and —
+  for `tools/call` — `Mcp-Name` into HTTP headers. Mismatches return `-32020`.
+  Real MCP clients send these automatically; hand-rolled `curl` calls must not omit them.
+
+Nothing here depends on session state: the server issues no server→client
+requests and uses no sampling, roots, subscriptions, or logging (all deprecated
+in `2026-07-28`).
+
 ## CLI flags
 
 ```
@@ -78,17 +96,49 @@ On the client machine, SSH-tunnel the port:
 ssh -N -L 3000:127.0.0.1:3000 user@remote-host
 ```
 
-Claude Desktop config:
+### Claude Code
+
+```bash
+claude mcp add --transport http shell-remote http://127.0.0.1:3000/mcp \
+  --header "Authorization: Bearer YOUR_TOKEN"
+```
+
+Or as JSON in `.mcp.json` / `~/.claude.json`:
 ```json
 {
   "mcpServers": {
     "shell-remote": {
+      "type": "http",
       "url": "http://127.0.0.1:3000/mcp",
       "headers": { "Authorization": "Bearer YOUR_TOKEN" }
     }
   }
 }
 ```
+
+`"type"` is **required**. An entry with a `url` but no `type` is read as a stdio
+server and skipped. `"streamable-http"` is accepted as an alias for `"http"`.
+
+### Claude API MCP connector
+
+Pass the token as `authorization_token`; the connector needs both the server
+entry and a matching `mcp_toolset`:
+```json
+{
+  "mcp_servers": [
+    { "type": "url", "name": "shell", "url": "https://your-host/mcp",
+      "authorization_token": "YOUR_TOKEN" }
+  ],
+  "tools": [ { "type": "mcp_toolset", "mcp_server_name": "shell" } ]
+}
+```
+
+### claude.ai custom connectors — not supported
+
+Custom connectors added from claude.ai require the MCP server to act as a full
+OAuth 2.1 authorization server (browser-interactive flow, PKCE S256, Protected
+Resource Metadata discovery). A static bearer token is not accepted there. This
+server is bearer-only, so use Claude Code or the API connector above.
 
 ## Tool: `shell_execute`
 
@@ -172,6 +222,8 @@ docker run --rm mcp-linux-go --help
 
 - **Allowlist is not a security boundary** if you include `bash`, `sh`, `python`, `perl`, `node`, `ruby`, `awk`, `find`, `xargs`, `ssh`, `sudo`, `make`, or `env`. Any of these → RCE via `-c`/`-e`/`-exec`. Allowlist is only meaningful for inspection-only binaries (`ls`, `cat`, `grep`, `wc`, `head`, `tail`, `df`, `uptime`, etc.).
 - **Never expose to the public internet**, even with a token. Bind `127.0.0.1` + SSH tunnel.
+- **Bearer token is the only auth.** The server validates a shared secret; it does
+  not validate OAuth tokens, audiences, or scopes. Treat the token as root-equivalent.
 - **Run as non-root.** Passwordless sudo = RCE-to-root.
 - **On EC2**: enforce IMDSv2 with hop-limit 1 to stop credential theft → IAM pivot.
 - **Destroy the box when done.**
