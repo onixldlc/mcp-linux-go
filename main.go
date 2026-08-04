@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/user"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,7 +24,8 @@ import (
 const serverName = "mcp-linux-go"
 
 // serverVersion overridden at build time via:
-//   go build -ldflags "-X main.serverVersion=$(git describe --tags --always --dirty)"
+//
+//	go build -ldflags "-X main.serverVersion=$(git describe --tags --always --dirty)"
 var serverVersion = "dev"
 
 // protocolVersion is the newest MCP revision the pinned go-sdk speaks. The SDK
@@ -40,6 +43,136 @@ type config struct {
 	port          int
 	token         string
 	allowCommands string
+	trustedHosts  string
+	logRequests   bool
+}
+
+// logf writes a timestamped server line to stderr. Rejections always log; full
+// per-request lines only under --log-requests.
+func logf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "[%s %s] %s\n",
+		serverName, time.Now().Format("15:04:05"), fmt.Sprintf(format, a...))
+}
+
+// reqDesc summarizes a request for the log without leaking bodies or tokens.
+// Mcp-Method/Mcp-Name are the SEP-2243 headers real clients mirror the JSON-RPC
+// call into, so they identify the call without parsing the body.
+func reqDesc(r *http.Request) string {
+	desc := fmt.Sprintf("%s %s host=%q from=%s", r.Method, r.URL.Path, r.Host, r.RemoteAddr)
+	if m := r.Header.Get("Mcp-Method"); m != "" {
+		desc += " mcp-method=" + m
+	}
+	if n := r.Header.Get("Mcp-Name"); n != "" {
+		desc += " mcp-name=" + n
+	}
+	if v := r.Header.Get("Mcp-Protocol-Version"); v != "" {
+		desc += " proto=" + v
+	}
+	return desc
+}
+
+// statusRecorder captures the response status for the access log. It forwards
+// Flush because the streamable HTTP transport streams SSE responses.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// requestLog is the outermost middleware so it observes the status actually
+// sent, including 401/403 produced by the guards below it.
+func requestLog(enabled bool, next http.Handler) http.Handler {
+	if !enabled {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
+		logf("%d %s ua=%q %s", rec.status, reqDesc(r),
+			r.Header.Get("User-Agent"), time.Since(start).Round(time.Millisecond))
+	})
+}
+
+// parseTrustedHosts builds the set of extra Host header values accepted by
+// hostGuard, keyed by hostname with any port stripped.
+func parseTrustedHosts(csv string) map[string]bool {
+	set := map[string]bool{}
+	for _, h := range strings.Split(csv, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			set[strings.ToLower(hostnameOnly(h))] = true
+		}
+	}
+	return set
+}
+
+func hostnameOnly(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return h
+	}
+	return hostport
+}
+
+func isLoopbackHost(hostport string) bool {
+	h := hostnameOnly(hostport)
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(h, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// hostGuard reimplements the SDK's DNS-rebinding check with an allowlist.
+//
+// The SDK rejects any request whose Host header is non-loopback when the
+// connection landed on a loopback local address. That breaks container clients:
+// Docker/Podman forward "host.docker.internal" into the host's loopback, so the
+// connection is loopback but the Host header is not, and the request 403s.
+//
+// Naming a host here is far weaker than disabling the check outright. Rebinding
+// requires the attacker to control a DNS name resolving to 127.0.0.1 and to make
+// the victim send it as Host; that only works if the attacker controls the name
+// being trusted. Names like "host.docker.internal" are container-runtime-local
+// and not registrable by an attacker.
+func hostGuard(trusted map[string]bool, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		localAddr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+		if ok && localAddr != nil && isLoopbackHost(localAddr.String()) &&
+			!isLoopbackHost(r.Host) && !trusted[strings.ToLower(hostnameOnly(r.Host))] {
+			logf("403 DNS-rebinding guard rejected %s", reqDesc(r))
+			logf("    if that name is yours, restart with --trusted-hosts %q (or TRUSTED_HOSTS=%s)",
+				hostnameOnly(r.Host), hostnameOnly(r.Host))
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintf(w, "Forbidden: rejected Host header %q (DNS-rebinding protection).\n"+
+				"The server is on loopback but the client addressed it by another name.\n"+
+				"If that name is legitimate, allow it explicitly:\n"+
+				"  --trusted-hosts %q     (or TRUSTED_HOSTS=%s)\n",
+				r.Host, hostnameOnly(r.Host), hostnameOnly(r.Host))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func printHelp() {
@@ -53,6 +186,12 @@ Options:
       --token <str>              Bearer token for HTTP (>=16 chars)     [env: SHELL_MCP_TOKEN]
       --allow-commands <csv>     Comma-sep allowlist. Unset = unrestricted.
                                                                         [env: ALLOW_COMMANDS]
+      --trusted-hosts <csv>      Extra Host header values to accept when the
+                                 server listens on loopback.
+                                 e.g. host.docker.internal             [env: TRUSTED_HOSTS]
+      --log-requests             Log every HTTP request (method, path, Host,
+                                 MCP method, status). Rejections always log.
+                                                                       [env: LOG_REQUESTS]
   -h, --help                     Show this help
   -v, --version                  Show version
 
@@ -61,24 +200,27 @@ CLI flags override env vars. Env vars override defaults.
 Examples:
   %s --allow-commands "ls,cat,pwd,grep"
   %s -H 127.0.0.1 -p 3000 --token "$(openssl rand -hex 32)"
+  %s --trusted-hosts "host.docker.internal"   # client runs in a container
 
 Generate an HTTP token:
   openssl rand -hex 32
-`, serverName, serverVersion, serverName, serverName, serverName)
+`, serverName, serverVersion, serverName, serverName, serverName, serverName)
 }
 
 func parseConfig() config {
 	fs := flag.NewFlagSet(serverName, flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var (
-		host          string
-		hostShort     string
-		port          int
-		portShort     int
-		token         string
-		allow         string
-		help, helpS   bool
-		ver, verS     bool
+		host        string
+		hostShort   string
+		port        int
+		portShort   int
+		token       string
+		allow       string
+		trusted     string
+		logReqs     bool
+		help, helpS bool
+		ver, verS   bool
 	)
 	fs.StringVar(&host, "host", "", "HTTP bind address")
 	fs.StringVar(&hostShort, "H", "", "HTTP bind address (short)")
@@ -86,6 +228,8 @@ func parseConfig() config {
 	fs.IntVar(&portShort, "p", 0, "HTTP port (short)")
 	fs.StringVar(&token, "token", "", "Bearer token")
 	fs.StringVar(&allow, "allow-commands", "", "Comma-sep allowlist")
+	fs.StringVar(&trusted, "trusted-hosts", "", "Comma-sep extra Host header values")
+	fs.BoolVar(&logReqs, "log-requests", false, "Log every HTTP request")
 	fs.BoolVar(&help, "help", false, "Show help")
 	fs.BoolVar(&helpS, "h", false, "Show help (short)")
 	fs.BoolVar(&ver, "version", false, "Show version")
@@ -135,8 +279,23 @@ func parseConfig() config {
 	if allowVal == "" {
 		allowVal = os.Getenv("ALLOWED_COMMANDS")
 	}
+	trustedVal := trusted
+	if trustedVal == "" {
+		trustedVal = os.Getenv("TRUSTED_HOSTS")
+	}
+	logReqsVal := logReqs
+	if !logReqsVal {
+		switch strings.ToLower(os.Getenv("LOG_REQUESTS")) {
+		case "1", "true", "yes":
+			logReqsVal = true
+		}
+	}
 
-	return config{host: hostVal, port: portRaw, token: tokenVal, allowCommands: allowVal}
+	return config{
+		host: hostVal, port: portRaw, token: tokenVal,
+		allowCommands: allowVal, trustedHosts: trustedVal,
+		logRequests: logReqsVal,
+	}
 }
 
 func firstNonEmpty(xs ...string) string {
@@ -189,6 +348,21 @@ func bootBanner(cfg config, allow validator.AllowList) {
 		log("allowlist:   " + strings.Join(allow.Sorted(), ", "))
 	}
 
+	if t := parseTrustedHosts(cfg.trustedHosts); len(t) > 0 {
+		names := make([]string, 0, len(t))
+		for h := range t {
+			names = append(names, h)
+		}
+		sort.Strings(names)
+		log("trusted-hosts: " + strings.Join(names, ", ") + " (plus loopback)")
+	}
+
+	if cfg.logRequests {
+		log("logging:     per-request (--log-requests)")
+	} else {
+		log("logging:     rejections only — add --log-requests for every request")
+	}
+
 	log(fmt.Sprintf("bind:        http://%s:%d/mcp", cfg.host, cfg.port))
 	log(fmt.Sprintf("health:      http://%s:%d/healthz", cfg.host, cfg.port))
 	if cfg.token != "" && len(cfg.token) >= 16 {
@@ -239,15 +413,26 @@ func main() {
 	}, &mcp.StreamableHTTPOptions{
 		Stateless:           true,
 		MaxRequestBodyBytes: maxRequestBodyBytes,
+		// hostGuard below performs this check with an allowlist the SDK's
+		// blanket version does not support.
+		DisableLocalhostProtection: true,
 	})
 
-	// go-sdk v1.6.0 stopped enabling cross-origin protection by default and
-	// deprecated the option field. Wrap the handler ourselves to keep the
-	// DNS-rebinding/CSRF protection that v1.5.0 applied implicitly.
-	crossOrigin := http.NewCrossOriginProtection()
-
+	// No http.CrossOriginProtection wrapper here, deliberately. It rejects any
+	// request carrying "Origin: null" or "Sec-Fetch-Site: cross-site" with a 403,
+	// which breaks legitimate non-browser MCP clients, and it buys nothing for
+	// this server:
+	//   - Browser CSRF cannot set "Authorization: Bearer <secret>" cross-origin;
+	//     a custom header forces a CORS preflight this server never approves.
+	//     Auth below already blocks that entire class.
+	//   - DNS rebinding is handled by the SDK's own localhost protection
+	//     (StreamableHTTPOptions.DisableLocalhostProtection, on by default),
+	//     which rejects a non-localhost Host header on a localhost connection.
+	// Bearer auth is outermost so unauthenticated calls get a 401 challenge
+	// rather than an opaque 403.
+	trusted := parseTrustedHosts(cfg.trustedHosts)
 	protect := func(h http.Handler) http.Handler {
-		return crossOrigin.Handler(bearerAuth(cfg.token, h))
+		return requestLog(cfg.logRequests, hostGuard(trusted, bearerAuth(cfg.token, h)))
 	}
 
 	mux := http.NewServeMux()
@@ -282,11 +467,19 @@ func bearerAuth(token string, next http.Handler) http.Handler {
 		h := r.Header.Get("Authorization")
 		const prefix = "Bearer "
 		if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+			reason := "missing Authorization header"
+			if h != "" {
+				reason = "malformed Authorization header (expected \"Bearer <token>\")"
+			}
+			logf("401 %s — %s", reqDesc(r), reason)
 			unauth(w, "")
 			return
 		}
 		got := []byte(h[len(prefix):])
 		if subtle.ConstantTimeCompare(got, expected) != 1 {
+			// Fingerprints only — never log the presented token itself.
+			logf("401 %s — token mismatch (presented fp %s, expected fp %s)",
+				reqDesc(r), tokenFingerprint(string(got)), tokenFingerprint(token))
 			unauth(w, "invalid_token")
 			return
 		}

@@ -48,6 +48,11 @@ mcp-linux-go [options]
       --token <str>              Bearer token for HTTP (>=16 chars)     [env: SHELL_MCP_TOKEN]
       --allow-commands <csv>     Comma-sep allowlist.                   [env: ALLOW_COMMANDS]
                                  Unset = unrestricted (lab mode).
+      --trusted-hosts <csv>      Extra Host header values to accept     [env: TRUSTED_HOSTS]
+                                 when listening on loopback.
+                                 e.g. host.docker.internal
+      --log-requests             Log every HTTP request                 [env: LOG_REQUESTS]
+                                 Rejections always log.
   -h, --help                     Show help
   -v, --version                  Show version
 ```
@@ -103,6 +108,22 @@ claude mcp add --transport http shell-remote http://127.0.0.1:3000/mcp \
   --header "Authorization: Bearer YOUR_TOKEN"
 ```
 
+**Client inside a container** (Claude Code in Docker/Podman reaching the host):
+the client addresses the server as `host.docker.internal`, but the runtime
+forwards that into the host's loopback. The connection is loopback while the
+`Host` header is not, which trips DNS-rebinding protection and returns **403** —
+easy to misread as a bad token, since Claude Code reports it as a rejected
+`Authorization` header. Name the host explicitly:
+
+```bash
+mcp-linux-go --token "$TOKEN" --trusted-hosts "host.docker.internal"
+```
+
+```bash
+claude mcp add --transport http shell-remote http://host.docker.internal:3000/mcp \
+  --header "Authorization: Bearer YOUR_TOKEN"
+```
+
 Or as JSON in `.mcp.json` / `~/.claude.json`:
 ```json
 {
@@ -118,6 +139,37 @@ Or as JSON in `.mcp.json` / `~/.claude.json`:
 
 `"type"` is **required**. An entry with a `url` but no `type` is read as a stdio
 server and skipped. `"streamable-http"` is accepted as an alias for `"http"`.
+
+### Diagnosing connection failures
+
+Claude Code reports every 4xx as an `Authorization` problem, so its message is
+not a reliable diagnosis. Read the server's stderr instead — rejections always
+log the real reason:
+
+```
+[mcp-linux-go 04:21:45] 403 DNS-rebinding guard rejected POST /mcp host="host.docker.internal:3000" from=127.0.0.1:38094 mcp-method=tools/list proto=2026-07-28
+[mcp-linux-go 04:21:45]     if that name is yours, restart with --trusted-hosts "host.docker.internal" (or TRUSTED_HOSTS=host.docker.internal)
+[mcp-linux-go 04:21:45] 401 POST /mcp host="127.0.0.1:3117" — token mismatch (presented fp wrongt…rong, expected fp 9de4dd…9a24)
+[mcp-linux-go 04:21:45] 401 POST /mcp host="127.0.0.1:3117" — missing Authorization header
+```
+
+Token fingerprints (first 6 + last 4 chars) let you compare what the client sent
+against the boot banner without the log ever holding the token itself.
+
+`--log-requests` adds a line per request — status, `Host`, MCP method/tool name,
+user agent, duration:
+
+```
+[mcp-linux-go 04:22:09] 200 POST /mcp host="127.0.0.1:3117" from=127.0.0.1:37384 mcp-method=tools/call mcp-name=shell_execute proto=2026-07-28 ua="claude-code/2.1.0" 2ms
+```
+
+Two response messages distinguish the guards, which matters because both are
+403s and both look like auth failures to the client:
+
+| Body | From | Meaning |
+|---|---|---|
+| `Forbidden: rejected Host header … (DNS-rebinding protection)` | this server | Add `--trusted-hosts` |
+| `Forbidden: invalid Host header …` | the go-sdk | **Stale binary** — predates the `--trusted-hosts` support; rebuild |
 
 ### Claude API MCP connector
 
@@ -182,6 +234,8 @@ All env vars have a CLI-flag equivalent (see [CLI flags](#cli-flags)). Flags ove
 | `SHELL_MCP_TOKEN` | `--token` | — | Required, ≥16 chars |
 | `ALLOW_COMMANDS` | `--allow-commands` | unset | Comma list. Unset → unrestricted. |
 | `ALLOWED_COMMANDS` | — | — | Alias of `ALLOW_COMMANDS` |
+| `TRUSTED_HOSTS` | `--trusted-hosts` | unset | Extra `Host` values. Loopback always allowed. |
+| `LOG_REQUESTS` | `--log-requests` | unset | `1`/`true`/`yes` → log every request. |
 
 ## Build locally
 
@@ -224,6 +278,16 @@ docker run --rm mcp-linux-go --help
 - **Never expose to the public internet**, even with a token. Bind `127.0.0.1` + SSH tunnel.
 - **Bearer token is the only auth.** The server validates a shared secret; it does
   not validate OAuth tokens, audiences, or scopes. Treat the token as root-equivalent.
+- **No `Origin`/`Sec-Fetch-Site` checking, on purpose.** It would 403 legitimate
+  non-browser clients that send `Origin: null`, while adding nothing: a browser
+  cannot attach `Authorization: Bearer <secret>` cross-origin without a CORS
+  preflight this server never approves. DNS rebinding is still blocked by the
+  `Host`-header guard below.
+- **DNS-rebinding guard is on by default.** A non-loopback `Host` header on a
+  loopback connection is rejected with 403. `--trusted-hosts` pokes a named hole
+  in it, which is much narrower than disabling it: rebinding needs the attacker
+  to control the DNS name being trusted, and `host.docker.internal` is
+  container-runtime-local, not registrable. Do not add public names you don't own.
 - **Run as non-root.** Passwordless sudo = RCE-to-root.
 - **On EC2**: enforce IMDSv2 with hop-limit 1 to stop credential theft → IAM pivot.
 - **Destroy the box when done.**
