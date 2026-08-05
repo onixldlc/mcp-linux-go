@@ -89,6 +89,9 @@ Or via env:
 export SHELL_MCP_TOKEN=$(openssl rand -hex 32)
 # optionally: export ALLOW_COMMANDS="ls,cat,apt-get,..."
 HOST=127.0.0.1 PORT=3000 ./mcp-linux-go-linux-amd64
+
+# if you are using docker for the mcp client you need to add --trusted-hosts
+HOST=127.0.0.1 PORT=3000 ./mcp-linux-go-linux-amd64 --trusted-hosts "host.docker.internal"
 ```
 
 Generate a token:
