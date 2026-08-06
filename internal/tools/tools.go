@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	DefaultTimeoutSec = 120
-	MaxTimeoutSec     = 1800
+	DefaultTimeoutSec = 20
+	MaxTimeoutSec     = 120
 	OutputCapBytes    = 1_000_000
 	MaxFileRead       = 10_000_000
 	MaxFileWrite      = 50_000_000
