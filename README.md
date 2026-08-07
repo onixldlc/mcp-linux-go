@@ -94,6 +94,15 @@ HOST=127.0.0.1 PORT=3000 ./mcp-linux-go-linux-amd64
 HOST=127.0.0.1 PORT=3000 ./mcp-linux-go-linux-amd64 --trusted-hosts "host.docker.internal"
 ```
 
+Pre-safe so you can start it at anytime:
+```bash
+# generate it once
+echo "$(openssl rand -hex 32)" > .mcpkey
+
+# and load it to env
+export SHELL_MCP_TOKEN=$(cat ~/.mcpkey) && HOST=127.0.0.1 PORT=3000 ./mcp-linux-go-linux-amd64 --trusted-hosts=host.docker.internal
+```
+
 Generate a token:
 ```bash
 openssl rand -hex 32
