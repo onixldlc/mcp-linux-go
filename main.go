@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -39,12 +41,13 @@ const protocolVersion = "2026-07-28"
 const maxRequestBodyBytes = int64(tools.MaxFileWrite)*4/3 + 8<<20
 
 type config struct {
-	host          string
-	port          int
-	token         string
-	allowCommands string
-	trustedHosts  string
-	logRequests   bool
+	host           string
+	port           int
+	token          string
+	tokenGenerated bool
+	allowCommands  string
+	trustedHosts   string
+	logRequests    bool
 }
 
 // logf writes a timestamped server line to stderr. Rejections always log; full
@@ -183,7 +186,9 @@ Usage: %s [options]
 Options:
   -H, --host <addr>              HTTP bind address (default: 127.0.0.1) [env: HOST]
   -p, --port <num>               HTTP port (default: 3000)              [env: PORT]
-      --token <str>              Bearer token for HTTP (>=16 chars)     [env: SHELL_MCP_TOKEN]
+      --token <str>              Bearer token for HTTP (>=16 chars). "auto"
+                                 mints one per run and prints it in the banner.
+                                                                        [env: SHELL_MCP_TOKEN]
       --allow-commands <csv>     Comma-sep allowlist. Unset = unrestricted.
                                                                         [env: ALLOW_COMMANDS]
       --trusted-hosts <csv>      Extra Host header values to accept when the
@@ -200,11 +205,12 @@ CLI flags override env vars. Env vars override defaults.
 Examples:
   %s --allow-commands "ls,cat,pwd,grep"
   %s -H 127.0.0.1 -p 3000 --token "$(openssl rand -hex 32)"
+  %s --token auto                             # server mints and prints one
   %s --trusted-hosts "host.docker.internal"   # client runs in a container
 
 Generate an HTTP token:
   openssl rand -hex 32
-`, serverName, serverVersion, serverName, serverName, serverName, serverName)
+`, serverName, serverVersion, serverName, serverName, serverName, serverName, serverName)
 }
 
 func parseConfig() config {
@@ -226,7 +232,7 @@ func parseConfig() config {
 	fs.StringVar(&hostShort, "H", "", "HTTP bind address (short)")
 	fs.IntVar(&port, "port", 0, "HTTP port")
 	fs.IntVar(&portShort, "p", 0, "HTTP port (short)")
-	fs.StringVar(&token, "token", "", "Bearer token")
+	fs.StringVar(&token, "token", "", "Bearer token, or \"auto\" to mint one")
 	fs.StringVar(&allow, "allow-commands", "", "Comma-sep allowlist")
 	fs.StringVar(&trusted, "trusted-hosts", "", "Comma-sep extra Host header values")
 	fs.BoolVar(&logReqs, "log-requests", false, "Log every HTTP request")
@@ -279,6 +285,11 @@ func parseConfig() config {
 	if allowVal == "" {
 		allowVal = os.Getenv("ALLOWED_COMMANDS")
 	}
+	tokenGenerated := false
+	if strings.EqualFold(tokenVal, "auto") {
+		tokenVal = generateToken()
+		tokenGenerated = true
+	}
 	trustedVal := trusted
 	if trustedVal == "" {
 		trustedVal = os.Getenv("TRUSTED_HOSTS")
@@ -293,7 +304,8 @@ func parseConfig() config {
 
 	return config{
 		host: hostVal, port: portRaw, token: tokenVal,
-		allowCommands: allowVal, trustedHosts: trustedVal,
+		tokenGenerated: tokenGenerated,
+		allowCommands:  allowVal, trustedHosts: trustedVal,
 		logRequests: logReqsVal,
 	}
 }
@@ -314,6 +326,16 @@ func firstNonZeroInt(xs ...int) int {
 		}
 	}
 	return 0
+}
+
+// generateToken returns 32 random bytes hex encoded, as "openssl rand -hex 32".
+func generateToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		fmt.Fprintf(os.Stderr, "[%s] FATAL: cannot generate a token: %v\n", serverName, err)
+		os.Exit(1)
+	}
+	return hex.EncodeToString(b)
 }
 
 func tokenFingerprint(tok string) string {
@@ -366,6 +388,9 @@ func bootBanner(cfg config, allow validator.AllowList) {
 	log(fmt.Sprintf("bind:        http://%s:%d/mcp", cfg.host, cfg.port))
 	log(fmt.Sprintf("health:      http://%s:%d/healthz", cfg.host, cfg.port))
 	if cfg.token != "" && len(cfg.token) >= 16 {
+		if cfg.tokenGenerated {
+			log("auth:        token generated for this run (--token auto) — it lives nowhere else:")
+		}
 		log(fmt.Sprintf("auth:        Bearer token (%d chars, fp %s):", len(cfg.token), tokenFingerprint(cfg.token)))
 		log("             " + cfg.token)
 		log("             Authorization: Bearer " + cfg.token)

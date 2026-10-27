@@ -17,6 +17,8 @@ Same request/response shape as upstream, so existing clients work unchanged.
 | **HTTP transport + bearer token** | mcp-linux-js | For remote control |
 | `read_file` / `write_file` / `upload_file_b64` / `list_dir` / `system_info` | mcp-linux-js | Quality-of-life |
 | Single-binary build (`go build`) | new | 5 platforms via CI |
+| Container image on GHCR | new | `ghcr.io/onixldlc/mcp-linux-go`, linux/amd64 + linux/arm64 |
+| Self-minted token (`--token auto`) | new | Printed in the boot banner; makes the image zero-config |
 
 HTTP-only. No stdio transport in this port.
 
@@ -45,7 +47,9 @@ mcp-linux-go [options]
 
   -H, --host <addr>              HTTP bind address (default: 127.0.0.1) [env: HOST]
   -p, --port <num>               HTTP port (default: 3000)              [env: PORT]
-      --token <str>              Bearer token for HTTP (>=16 chars)     [env: SHELL_MCP_TOKEN]
+      --token <str>              Bearer token for HTTP (>=16 chars).     [env: SHELL_MCP_TOKEN]
+                                 "auto" mints one per run and prints it
+                                 in the boot banner.
       --allow-commands <csv>     Comma-sep allowlist.                   [env: ALLOW_COMMANDS]
                                  Unset = unrestricted (lab mode).
       --trusted-hosts <csv>      Extra Host header values to accept     [env: TRUSTED_HOSTS]
@@ -72,6 +76,9 @@ ALLOW_COMMANDS="ls,cat,pwd,grep,wc,find" mcp-linux-go
 
 # Unrestricted (lab): no allowlist — emits WARNING on boot
 mcp-linux-go --token "$(openssl rand -hex 32)"
+
+# No token to hand around: the server mints one and prints it in the banner
+mcp-linux-go --token auto
 ```
 
 ## HTTP transport with bearer token
@@ -106,6 +113,14 @@ export SHELL_MCP_TOKEN=$(cat ~/.mcpkey) && HOST=127.0.0.1 PORT=3000 ./mcp-linux-
 Generate a token:
 ```bash
 openssl rand -hex 32
+```
+
+Or let the server do it — `auto` mints 32 random bytes per run and prints them
+in the boot banner, which is the only place they exist:
+```bash
+./mcp-linux-go-linux-amd64 --token auto
+# [mcp-linux-go] auth:        token generated for this run (--token auto) — it lives nowhere else:
+# [mcp-linux-go]              34aa8f7b…f0f72d
 ```
 
 On the client machine, SSH-tunnel the port:
@@ -243,7 +258,7 @@ All env vars have a CLI-flag equivalent (see [CLI flags](#cli-flags)). Flags ove
 |---|---|---|---|
 | `HOST` | `-H, --host` | `127.0.0.1` | HTTP bind |
 | `PORT` | `-p, --port` | `3000` | HTTP port |
-| `SHELL_MCP_TOKEN` | `--token` | — | Required, ≥16 chars |
+| `SHELL_MCP_TOKEN` | `--token` | — | Required, ≥16 chars. `auto` → server mints one and logs it. |
 | `ALLOW_COMMANDS` | `--allow-commands` | unset | Comma list. Unset → unrestricted. |
 | `ALLOWED_COMMANDS` | — | — | Alias of `ALLOW_COMMANDS` |
 | `TRUSTED_HOSTS` | `--trusted-hosts` | unset | Extra `Host` values. Loopback always allowed. |
@@ -259,29 +274,82 @@ GOOS=linux  GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o di
 GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/mcp-linux-go-darwin-arm64 .
 ```
 
-CI builds 5 platforms (linux-amd64, linux-arm64, darwin-amd64, darwin-arm64, windows-amd64) on tag `v*`.
+CI builds those 5 platforms (linux-amd64, linux-arm64, darwin-amd64, darwin-arm64,
+windows-amd64) plus the container image. See [Releasing](#releasing).
 
 ## Docker
 
-```bash
-docker build -t mcp-linux-go .
+Published on every release, `linux/amd64` and `linux/arm64`:
 
-# via env
-docker run --rm \
-  -e SHELL_MCP_TOKEN=$(openssl rand -hex 32) \
+```bash
+docker pull ghcr.io/onixldlc/mcp-linux-go:latest
+```
+
+The image needs no configuration. It binds `0.0.0.0` inside the container, runs
+unrestricted, and mints its own token — read it out of the log:
+
+```bash
+docker run -d --name mcp -p 127.0.0.1:3000:3000 ghcr.io/onixldlc/mcp-linux-go:latest
+docker logs mcp | grep Bearer
+# [mcp-linux-go]              Authorization: Bearer 34aa8f7b…f0f72d
+```
+
+That is what the image is for: a disposable box an agent can run any command in.
+It is also why you publish the port to `127.0.0.1` (or a private network) and
+never to a public interface.
+
+Pin the token so it survives a restart, and narrow what may run:
+
+```bash
+docker run -d --name mcp \
+  -e SHELL_MCP_TOKEN="$(openssl rand -hex 32)" \
   -e ALLOW_COMMANDS="ls,cat,grep" \
   -p 127.0.0.1:3000:3000 \
-  mcp-linux-go
+  ghcr.io/onixldlc/mcp-linux-go:latest
+```
 
-# via CLI flags
-docker run --rm \
-  -p 127.0.0.1:3000:3000 \
-  mcp-linux-go \
-    --token "$(openssl rand -hex 32)" \
-    --allow-commands "ls,cat,grep"
+Flags work the same as env, and `--help` works without starting a server:
 
-# print help
-docker run --rm mcp-linux-go --help
+```bash
+docker run --rm ghcr.io/onixldlc/mcp-linux-go:latest --help
+
+docker run --rm -p 127.0.0.1:3000:3000 ghcr.io/onixldlc/mcp-linux-go:latest \
+  --token "$(openssl rand -hex 32)" \
+  --allow-commands "ls,cat,grep" \
+  --log-requests
+```
+
+Build it yourself — the Dockerfile lives in `docker/`, the context is the repo root:
+
+```bash
+docker build -f docker/Dockerfile -t mcp-linux-go --build-arg VERSION="$(cat VERSION)" .
+```
+
+## Releasing
+
+`VERSION` is both the trigger and the single source of the version. Push a commit
+that changes it to `main` and [build.yml](.github/workflows/build.yml) does the rest:
+
+1. **determine-version** — reads `VERSION`. It carries the whole tag: a base
+   version plus this repo's revision counter, `v0.2.2-r4`. Bump `-rN` for a
+   release on top of the same base, or move the base and drop back to no suffix.
+2. **test** — `go vet`, `gofmt -l`, `go test ./...`.
+3. **build** — the 5 binaries, with the version compiled in. linux-amd64 is then
+   started with `--token auto` and driven through [scripts/smoke.sh](scripts/smoke.sh):
+   `/healthz`, 401 without a token, the legacy `initialize` path, all six tools
+   advertised, and `shell_execute` actually running a command.
+4. **image** — `docker/Dockerfile` built for amd64 and smoke tested as a container
+   the same way, then pushed for amd64 + arm64 as `:<version>` and `:latest`.
+5. **release** — tags the commit and attaches the binaries plus `SHA256SUMS`.
+
+Nothing is tagged by hand; the tag comes from `VERSION`. `workflow_dispatch` runs
+the same pipeline with an optional version override, and with **publish** unchecked
+it builds and smoke tests without pushing or tagging anything.
+
+The smoke test is runnable locally against any server you have a token for:
+
+```bash
+scripts/smoke.sh http://127.0.0.1:3000 "$SHELL_MCP_TOKEN"
 ```
 
 ## Security reality check

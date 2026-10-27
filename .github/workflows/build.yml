@@ -1,0 +1,358 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'VERSION'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (e.g. v0.2.2-r4). Empty = read the VERSION file.'
+        required: false
+        default: ''
+      publish:
+        description: 'Push images, create the tag and the release. Uncheck to build and smoke test only.'
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: ghcr.io
+  # Lowercase: GHCR rejects capitals.
+  IMAGE_NAME: mcp-linux-go
+
+permissions:
+  contents: read
+
+jobs:
+  determine-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      bare_version: ${{ steps.version.outputs.bare_version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          INPUT_VERSION='${{ github.event.inputs.version }}'
+
+          if [[ -n "${INPUT_VERSION}" ]]; then
+            VERSION="${INPUT_VERSION}"
+          else
+            VERSION="$(tr -d '[:space:]' < VERSION)"
+          fi
+
+          if [[ -z "${VERSION}" ]]; then
+            echo "::error::VERSION is empty."
+            exit 1
+          fi
+
+          # VERSION carries the v and the -rN revision itself (v0.2.2-r4).
+          [[ "${VERSION}" == v* ]] || VERSION="v${VERSION}"
+
+          # Git refs and docker tags allow a narrow character set.
+          VERSION="$(printf '%s' "${VERSION}" | tr -c 'A-Za-z0-9._-' '-')"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            PUBLISH='${{ github.event.inputs.publish }}'
+          else
+            # The only other trigger is a push that changed VERSION.
+            PUBLISH=true
+          fi
+
+          # Tags keep the v; -ldflags gets the bare number.
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "bare_version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+          echo "publish=${PUBLISH}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION} bare_version=${VERSION#v} publish=${PUBLISH}"
+
+  test:
+    name: Vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [[ -n "${unformatted}" ]]; then
+            echo "::error::gofmt wants changes in: ${unformatted}"
+            exit 1
+          fi
+
+      - name: go test
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.target.label }}
+    runs-on: ubuntu-latest
+    needs: [determine-version, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { label: "linux-amd64",   goos: "linux",   goarch: "amd64", out: "mcp-linux-go-linux-amd64" }
+          - { label: "linux-arm64",   goos: "linux",   goarch: "arm64", out: "mcp-linux-go-linux-arm64" }
+          - { label: "darwin-amd64",  goos: "darwin",  goarch: "amd64", out: "mcp-linux-go-darwin-amd64" }
+          - { label: "darwin-arm64",  goos: "darwin",  goarch: "arm64", out: "mcp-linux-go-darwin-arm64" }
+          - { label: "windows-amd64", goos: "windows", goarch: "amd64", out: "mcp-linux-go-windows-amd64.exe" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}
+          CGO_ENABLED: "0"
+          BARE_VERSION: ${{ needs.determine-version.outputs.bare_version }}
+        run: |
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags "-s -w -X main.serverVersion=${BARE_VERSION}" \
+            -o dist/${{ matrix.target.out }} .
+
+      - name: Smoke test the binary
+        # Only the native target runs here; the rest are proven by compiling.
+        if: matrix.target.label == 'linux-amd64'
+        env:
+          BIN: dist/${{ matrix.target.out }}
+          BARE_VERSION: ${{ needs.determine-version.outputs.bare_version }}
+        run: |
+          set -euo pipefail
+          chmod +x "${BIN}"
+
+          test "$("./${BIN}" --version)" = "mcp-linux-go v${BARE_VERSION}"
+          echo "binary reports v${BARE_VERSION}"
+
+          "./${BIN}" --help | grep -q -- '--allow-commands'
+          echo "help text present"
+
+          "./${BIN}" -H 127.0.0.1 -p 3000 --token auto --log-requests \
+            > server.log 2>&1 &
+          server_pid=$!
+
+          token=""
+          for _ in $(seq 1 30); do
+            token="$(grep -oP 'Authorization: Bearer \K\S+' server.log | head -1 || true)"
+            [[ -n "${token}" ]] && break
+            sleep 1
+          done
+          if [[ -z "${token}" ]]; then
+            echo "the server never printed a generated token"
+            cat server.log
+            exit 1
+          fi
+          echo "--token auto minted a ${#token}-char token"
+
+          bash scripts/smoke.sh http://127.0.0.1:3000 "${token}" || {
+            cat server.log
+            kill "${server_pid}" 2>/dev/null || true
+            exit 1
+          }
+
+          kill "${server_pid}" 2>/dev/null || true
+
+      - name: Checksum
+        run: |
+          cd dist
+          sha256sum ${{ matrix.target.out }} > ${{ matrix.target.out }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.out }}
+          path: |
+            dist/${{ matrix.target.out }}
+            dist/${{ matrix.target.out }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Build image
+    runs-on: ubuntu-latest
+    needs: [determine-version, test]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Loaded locally first, so the smoke test runs before anything is pushed.
+      - name: Build amd64 locally
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          build-args: |
+            VERSION=${{ needs.determine-version.outputs.bare_version }}
+          tags: ${{ env.IMAGE_NAME }}:ci
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,mode=min,scope=image
+
+      - name: Smoke test the container
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          BARE_VERSION: ${{ needs.determine-version.outputs.bare_version }}
+        run: |
+          set -euo pipefail
+
+          docker run --rm "${IMAGE_NAME}:ci" --version \
+            | grep -q "mcp-linux-go v${BARE_VERSION}"
+          echo "image reports v${BARE_VERSION}"
+
+          # No -e of any kind: the copy-paste command from the README.
+          docker run -d --name mcp-ci -p 13000:3000 "${IMAGE_NAME}:ci" --log-requests
+
+          token=""
+          for _ in $(seq 1 30); do
+            token="$(docker logs mcp-ci 2>&1 | grep -oP 'Authorization: Bearer \K\S+' | head -1 || true)"
+            [[ -n "${token}" ]] && break
+            sleep 1
+          done
+          if [[ -z "${token}" ]]; then
+            echo "the container never printed a generated token"
+            docker logs mcp-ci
+            docker rm -f mcp-ci >/dev/null
+            exit 1
+          fi
+          echo "the container minted a ${#token}-char token and logged it"
+
+          docker logs mcp-ci 2>&1 | grep -q 'UNRESTRICTED'
+          echo "image runs unrestricted, as documented"
+
+          if ! bash scripts/smoke.sh http://127.0.0.1:13000 "${token}"; then
+            docker logs mcp-ci
+            docker rm -f mcp-ci >/dev/null
+            exit 1
+          fi
+
+          docker logs mcp-ci 2>&1 | grep -q 'http://0.0.0.0:3000/mcp'
+          echo "bound 0.0.0.0 inside the container"
+
+          docker rm -f mcp-ci >/dev/null
+          echo "container smoke test passed"
+
+      - name: Log in to GitHub Container Registry
+        if: needs.determine-version.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # arm64 joins here; amd64 comes from the cache the local build just filled.
+      - name: Build and push
+        if: needs.determine-version.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ needs.determine-version.outputs.bare_version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.determine-version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.determine-version.outputs.version }}
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,mode=min,scope=image
+
+      - name: Summary
+        run: |
+          V="${{ needs.determine-version.outputs.version }}"
+          IMG="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
+          echo "**Version:** \`${V}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Published:** ${{ needs.determine-version.outputs.publish }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${IMG}:${V}\`, \`${IMG}:latest\` (linux/amd64, linux/arm64)" >> $GITHUB_STEP_SUMMARY
+          echo "**Run:** \`docker run --rm -p 3000:3000 ${IMG}:${V}\` — token is in the logs" >> $GITHUB_STEP_SUMMARY
+
+  release:
+    name: Tag and release
+    runs-on: ubuntu-latest
+    needs: [determine-version, build, image]
+    if: needs.determine-version.outputs.publish == 'true'
+    permissions:
+      # The top-level grant is read-only; only this job writes refs.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        working-directory: dist
+        run: |
+          cat $(ls *.sha256 | sort) > SHA256SUMS
+          rm -f *.sha256
+          ls -lah
+          cat SHA256SUMS
+
+      # Creates the tag at this commit if it does not exist yet.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.determine-version.outputs.version }}
+          name: ${{ needs.determine-version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/mcp-linux-go-linux-amd64
+            dist/mcp-linux-go-linux-arm64
+            dist/mcp-linux-go-darwin-amd64
+            dist/mcp-linux-go-darwin-arm64
+            dist/mcp-linux-go-windows-amd64.exe
+            dist/SHA256SUMS
+          body: |
+            An MCP shell server over streamable HTTP: five static binaries, or a
+            container image for a disposable box an agent can drive.
+
+            ```
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.determine-version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+            ```
+
+            Spin one up — it mints its own token and prints it in the log:
+
+            ```
+            docker run --rm -p 3000:3000 \
+              ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.determine-version.outputs.version }}
+            ```
+
+            The image runs unrestricted by default. Narrow it with
+            `-e ALLOW_COMMANDS="ls,cat,pwd,grep"`, and pass your own
+            `-e SHELL_MCP_TOKEN=...` to keep the token stable across restarts.
+
+      - name: Summary
+        run: |
+          V="${{ needs.determine-version.outputs.version }}"
+          echo "**Tag:** \`${V}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Assets:** five binaries plus SHA256SUMS" >> $GITHUB_STEP_SUMMARY
+          echo "**Images:** \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${V}\`, \`:latest\`" >> $GITHUB_STEP_SUMMARY

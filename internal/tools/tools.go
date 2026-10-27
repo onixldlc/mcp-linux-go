@@ -408,16 +408,16 @@ func registerSystemInfo(server *mcp.Server, allow validator.AllowList) {
 		cwd, _ := os.Getwd()
 		home, _ := os.UserHomeDir()
 		info := map[string]any{
-			"hostname":  host,
-			"platform":  runtime.GOOS,
-			"arch":      runtime.GOARCH,
-			"go_version": runtime.Version(),
-			"user":      userName(u),
-			"home":      home,
-			"cwd":       cwd,
-			"uptime_sec": uptimeSec(),
+			"hostname":     host,
+			"platform":     runtime.GOOS,
+			"arch":         runtime.GOARCH,
+			"go_version":   runtime.Version(),
+			"user":         userName(u),
+			"home":         home,
+			"cwd":          cwd,
+			"uptime_sec":   uptimeSec(),
 			"total_mem_mb": totalMemMB(),
-			"allow_mode":  map[bool]string{true: "unrestricted", false: "allowlist"}[allow.Unrestricted],
+			"allow_mode":   map[bool]string{true: "unrestricted", false: "allowlist"}[allow.Unrestricted],
 		}
 		if !allow.Unrestricted {
 			info["allowed_commands"] = allow.Sorted()
