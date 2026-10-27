@@ -143,6 +143,19 @@ jobs:
           "./${BIN}" --help | grep -q -- '--allow-commands'
           echo "help text present"
 
+          "./${BIN}" --list-providers | grep -q '^\* claudecode'
+          "./${BIN}" --print-config --token 0123456789abcdef0123456789abcdef \
+            | grep -q '"type": "http"'
+          "./${BIN}" --print-config --provider openclaw --token 0123456789abcdef0123456789abcdef \
+            | grep -q 'transport: "streamable-http"'
+          "./${BIN}" --print-config --provider opencode --token 0123456789abcdef0123456789abcdef \
+            | grep -q '"type": "remote"'
+          if "./${BIN}" --print-config --provider nope --token 0123456789abcdef0123456789abcdef; then
+            echo "an unknown provider was accepted"
+            exit 1
+          fi
+          echo "providers render per runner, unknown names rejected"
+
           "./${BIN}" -H 127.0.0.1 -p 3000 --token auto --log-requests \
             > server.log 2>&1 &
           server_pid=$!
@@ -238,6 +251,13 @@ jobs:
 
           docker logs mcp-ci 2>&1 | grep -q 'UNRESTRICTED'
           echo "image runs unrestricted, as documented"
+
+          # The boot banner carries a paste-ready client config, claudecode by default.
+          docker logs mcp-ci 2>&1 | grep -q 'client:      Claude Code'
+          docker logs mcp-ci 2>&1 | grep -q '"type": "http"'
+          docker run --rm -e MCP_PROVIDER=opencode "${IMAGE_NAME}:ci" --print-config --token \
+            0123456789abcdef0123456789abcdef | grep -q '"type": "remote"'
+          echo "client config printed, MCP_PROVIDER honoured"
 
           if ! bash scripts/smoke.sh http://127.0.0.1:13000 "${token}"; then
             docker logs mcp-ci

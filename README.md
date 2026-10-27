@@ -17,6 +17,7 @@ Same request/response shape as upstream, so existing clients work unchanged.
 | **HTTP transport + bearer token** | mcp-linux-js | For remote control |
 | `read_file` / `write_file` / `upload_file_b64` / `list_dir` / `system_info` | mcp-linux-js | Quality-of-life |
 | Single-binary build (`go build`) | new | 5 platforms via CI |
+| Provider layer for other runners | new | `--provider claudecode\|opencode\|openclaw\|generic` |
 | Container image on GHCR | new | `ghcr.io/onixldlc/mcp-linux-go`, linux/amd64 + linux/arm64 |
 | Self-minted token (`--token auto`) | new | Printed in the boot banner; makes the image zero-config |
 
@@ -52,6 +53,11 @@ mcp-linux-go [options]
                                  in the boot banner.
       --allow-commands <csv>     Comma-sep allowlist.                   [env: ALLOW_COMMANDS]
                                  Unset = unrestricted (lab mode).
+      --provider <name>          Agent runner whose client config is     [env: MCP_PROVIDER]
+                                 printed on boot: claudecode (default),
+                                 opencode, openclaw, generic.
+      --print-config             Print that client config and exit
+      --list-providers           List the known runners and exit
       --trusted-hosts <csv>      Extra Host header values to accept     [env: TRUSTED_HOSTS]
                                  when listening on loopback.
                                  e.g. host.docker.internal
@@ -128,7 +134,55 @@ On the client machine, SSH-tunnel the port:
 ssh -N -L 3000:127.0.0.1:3000 user@remote-host
 ```
 
+### Agent runners (providers)
+
+Every runner spells an MCP server differently, so the server renders its own
+connection details into the shape yours reads. `claudecode` is the default:
+
+```bash
+mcp-linux-go --list-providers
+# * claudecode   Claude Code                  .mcp.json (project) or ~/.claude.json (user)
+#   generic      generic mcpServers block     the file your client reads mcpServers from
+#   openclaw     OpenClaw                     ~/.openclaw/openclaw.json (JSON5)
+#   opencode     opencode                     opencode.json (project root)
+
+# render one without starting a server
+mcp-linux-go --print-config --provider opencode --token "$TOKEN"
+```
+
+| Provider | Config file | Entry shape |
+|---|---|---|
+| `claudecode` (default) | `.mcp.json`, `~/.claude.json` | `mcpServers.<name>`, `"type": "http"` |
+| `opencode` | `opencode.json` | `mcp.servers.<name>`, `"type": "remote"`, `"protocol": "auto"` |
+| `openclaw` | `~/.openclaw/openclaw.json` (JSON5) | `mcp.servers.<name>`, `transport: "streamable-http"` |
+| `generic` | whatever your client reads | plain `mcpServers`, `"type": "http"` |
+
+The selected provider's block is also printed in the boot banner with the live
+URL and token, ready to paste:
+
+```
+[mcp-linux-go] client:      opencode — paste into opencode.json (project root)
+[mcp-linux-go]              {
+[mcp-linux-go]                "$schema": "https://opencode.ai/config.json",
+[mcp-linux-go]                "mcp": {
+[mcp-linux-go]                  "servers": {
+[mcp-linux-go]                    "mcp-linux-go": {
+[mcp-linux-go]                      "type": "remote",
+[mcp-linux-go]                      "url": "http://127.0.0.1:3000/mcp",
+...
+```
+
+A wildcard bind (`0.0.0.0`) is rendered as `127.0.0.1` in the config, since a
+client cannot dial a wildcard.
+
+Adding a runner is one file in [`internal/providers/`](internal/providers): a
+`Render` returning the block, an optional `CLI` one-liner, and `register()`.
+`go test ./internal/providers/` then checks it carries the URL, token and server
+name, and that the JSON shapes parse.
+
 ### Claude Code
+
+Also reachable as the default provider: `mcp-linux-go --print-config`.
 
 ```bash
 claude mcp add --transport http shell-remote http://127.0.0.1:3000/mcp \
@@ -261,6 +315,7 @@ All env vars have a CLI-flag equivalent (see [CLI flags](#cli-flags)). Flags ove
 | `SHELL_MCP_TOKEN` | `--token` | — | Required, ≥16 chars. `auto` → server mints one and logs it. |
 | `ALLOW_COMMANDS` | `--allow-commands` | unset | Comma list. Unset → unrestricted. |
 | `ALLOWED_COMMANDS` | — | — | Alias of `ALLOW_COMMANDS` |
+| `MCP_PROVIDER` | `--provider` | `claudecode` | Which runner's client config the banner prints. |
 | `TRUSTED_HOSTS` | `--trusted-hosts` | unset | Extra `Host` values. Loopback always allowed. |
 | `LOG_REQUESTS` | `--log-requests` | unset | `1`/`true`/`yes` → log every request. |
 
@@ -306,6 +361,14 @@ docker run -d --name mcp \
   -e ALLOW_COMMANDS="ls,cat,grep" \
   -p 127.0.0.1:3000:3000 \
   ghcr.io/onixldlc/mcp-linux-go:latest
+```
+
+Point it at a different runner, and read the config out of the log:
+
+```bash
+docker run -d --name mcp -e MCP_PROVIDER=openclaw -p 127.0.0.1:3000:3000 \
+  ghcr.io/onixldlc/mcp-linux-go:latest
+docker logs mcp | grep -A12 'client:'
 ```
 
 Flags work the same as env, and `--help` works without starting a server:

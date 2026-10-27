@@ -19,6 +19,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/onixldlc/mcp-linux-go/internal/providers"
 	"github.com/onixldlc/mcp-linux-go/internal/tools"
 	"github.com/onixldlc/mcp-linux-go/internal/validator"
 )
@@ -48,6 +49,7 @@ type config struct {
 	allowCommands  string
 	trustedHosts   string
 	logRequests    bool
+	provider       string
 }
 
 // logf writes a timestamped server line to stderr. Rejections always log; full
@@ -191,6 +193,11 @@ Options:
                                                                         [env: SHELL_MCP_TOKEN]
       --allow-commands <csv>     Comma-sep allowlist. Unset = unrestricted.
                                                                         [env: ALLOW_COMMANDS]
+      --provider <name>          Agent runner whose client config is printed
+                                 on boot: claudecode (default), opencode,
+                                 openclaw, generic.                     [env: MCP_PROVIDER]
+      --print-config             Print that client config and exit
+      --list-providers           List the known runners and exit
       --trusted-hosts <csv>      Extra Host header values to accept when the
                                  server listens on loopback.
                                  e.g. host.docker.internal             [env: TRUSTED_HOSTS]
@@ -206,11 +213,12 @@ Examples:
   %s --allow-commands "ls,cat,pwd,grep"
   %s -H 127.0.0.1 -p 3000 --token "$(openssl rand -hex 32)"
   %s --token auto                             # server mints and prints one
+  %s --print-config --provider opencode --token "$TOK"
   %s --trusted-hosts "host.docker.internal"   # client runs in a container
 
 Generate an HTTP token:
   openssl rand -hex 32
-`, serverName, serverVersion, serverName, serverName, serverName, serverName, serverName)
+`, serverName, serverVersion, serverName, serverName, serverName, serverName, serverName, serverName)
 }
 
 func parseConfig() config {
@@ -225,6 +233,9 @@ func parseConfig() config {
 		allow       string
 		trusted     string
 		logReqs     bool
+		provider    string
+		listProv    bool
+		printConf   bool
 		help, helpS bool
 		ver, verS   bool
 	)
@@ -235,6 +246,9 @@ func parseConfig() config {
 	fs.StringVar(&token, "token", "", "Bearer token, or \"auto\" to mint one")
 	fs.StringVar(&allow, "allow-commands", "", "Comma-sep allowlist")
 	fs.StringVar(&trusted, "trusted-hosts", "", "Comma-sep extra Host header values")
+	fs.StringVar(&provider, "provider", "", "Agent runner whose client config is printed")
+	fs.BoolVar(&listProv, "list-providers", false, "List the known runners")
+	fs.BoolVar(&printConf, "print-config", false, "Print the client config and exit")
 	fs.BoolVar(&logReqs, "log-requests", false, "Log every HTTP request")
 	fs.BoolVar(&help, "help", false, "Show help")
 	fs.BoolVar(&helpS, "h", false, "Show help (short)")
@@ -253,6 +267,10 @@ func parseConfig() config {
 	}
 	if ver || verS {
 		fmt.Printf("%s v%s\n", serverName, serverVersion)
+		os.Exit(0)
+	}
+	if listProv {
+		fmt.Print(providers.List())
 		os.Exit(0)
 	}
 
@@ -285,6 +303,26 @@ func parseConfig() config {
 	if allowVal == "" {
 		allowVal = os.Getenv("ALLOWED_COMMANDS")
 	}
+	providerVal := firstNonEmpty(provider, os.Getenv("MCP_PROVIDER"), providers.Default)
+	prov, ok := providers.Lookup(providerVal)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "[%s] unknown provider: %q\n", serverName, providerVal)
+		fmt.Fprint(os.Stderr, providers.List())
+		os.Exit(2)
+	}
+
+	if printConf {
+		tok := tokenVal
+		if tok == "" || strings.EqualFold(tok, "auto") {
+			tok = "<token>"
+			fmt.Fprintf(os.Stderr, "[%s] no token given; the config below carries a placeholder\n", serverName)
+		}
+		fmt.Print(providers.Config(prov, providers.Target{
+			Name: serverName, URL: clientURL(hostVal, portRaw), Token: tok,
+		}))
+		os.Exit(0)
+	}
+
 	tokenGenerated := false
 	if strings.EqualFold(tokenVal, "auto") {
 		tokenVal = generateToken()
@@ -307,6 +345,7 @@ func parseConfig() config {
 		tokenGenerated: tokenGenerated,
 		allowCommands:  allowVal, trustedHosts: trustedVal,
 		logRequests: logReqsVal,
+		provider:    prov.Name,
 	}
 }
 
@@ -326,6 +365,16 @@ func firstNonZeroInt(xs ...int) int {
 		}
 	}
 	return 0
+}
+
+// clientURL is the address a client dials. A wildcard bind is not an address
+// anything can connect to, so it becomes loopback here.
+func clientURL(host string, port int) string {
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		host = "127.0.0.1"
+	}
+	return fmt.Sprintf("http://%s:%d/mcp", host, port)
 }
 
 // generateToken returns 32 random bytes hex encoded, as "openssl rand -hex 32".
@@ -403,6 +452,17 @@ func bootBanner(cfg config, allow validator.AllowList) {
 		log("             Generate one:  openssl rand -hex 32")
 		log("             Pass via:      --token <token>   or   SHELL_MCP_TOKEN=<token>")
 	}
+	if p, ok := providers.Lookup(cfg.provider); ok && len(cfg.token) >= 16 {
+		log("client:      " + p.Title + " — paste into " + p.Path)
+		snippet := providers.Snippet(p, providers.Target{
+			Name: serverName, URL: clientURL(cfg.host, cfg.port), Token: cfg.token,
+		})
+		for _, line := range strings.Split(strings.TrimRight(snippet, "\n"), "\n") {
+			log("             " + line)
+		}
+		log("             another runner:  --list-providers, --provider <name>")
+	}
+
 	if cfg.host == "0.0.0.0" {
 		log("             ⚠  bound to 0.0.0.0 — token is your only defense. Prefer 127.0.0.1 + SSH tunnel.")
 	}
