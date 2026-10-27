@@ -320,9 +320,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
+      # Only the binaries. docker/build-push-action also uploads a
+      # *.dockerbuild build record per image job, and pulling those in broke
+      # this step on run #1.
+      - name: Download the binary artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: mcp-linux-go-*
           path: dist
           merge-multiple: true
 
