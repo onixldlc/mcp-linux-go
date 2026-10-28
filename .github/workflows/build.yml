@@ -137,20 +137,23 @@ jobs:
           set -euo pipefail
           chmod +x "${BIN}"
 
+          # Output is captured and matched from a variable throughout: a pipe
+          # into `grep -q` kills the writer with SIGPIPE the moment grep
+          # matches, and pipefail then reports that as 141.
           test "$("./${BIN}" --version)" = "mcp-linux-go v${BARE_VERSION}"
           echo "binary reports v${BARE_VERSION}"
 
-          "./${BIN}" --help | grep -q -- '--allow-commands'
+          grep -q -- '--allow-commands' <<<"$("./${BIN}" --help)"
           echo "help text present"
 
-          "./${BIN}" --list-providers | grep -q '^\* claudecode'
-          "./${BIN}" --print-config --token 0123456789abcdef0123456789abcdef \
-            | grep -q '"type": "http"'
-          "./${BIN}" --print-config --provider openclaw --token 0123456789abcdef0123456789abcdef \
-            | grep -q 'transport: "streamable-http"'
-          "./${BIN}" --print-config --provider opencode --token 0123456789abcdef0123456789abcdef \
-            | grep -q '"type": "remote"'
-          if "./${BIN}" --print-config --provider nope --token 0123456789abcdef0123456789abcdef; then
+          TOK=0123456789abcdef0123456789abcdef
+          grep -q '^\* claudecode' <<<"$("./${BIN}" --list-providers)"
+          grep -q '"type": "http"' <<<"$("./${BIN}" --print-config --token "${TOK}")"
+          grep -q 'transport: "streamable-http"' \
+            <<<"$("./${BIN}" --print-config --provider openclaw --token "${TOK}")"
+          grep -q '"type": "remote"' \
+            <<<"$("./${BIN}" --print-config --provider opencode --token "${TOK}")"
+          if "./${BIN}" --print-config --provider nope --token "${TOK}"; then
             echo "an unknown provider was accepted"
             exit 1
           fi
@@ -228,8 +231,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          docker run --rm "${IMAGE_NAME}:ci" --version \
-            | grep -q "mcp-linux-go v${BARE_VERSION}"
+          # `docker logs` is dumped to a file and matched from there. Piping it
+          # into `grep -q` kills it with SIGPIPE as soon as grep matches, and
+          # pipefail reports that as 141 — which is how this step first failed.
+          grep -q "mcp-linux-go v${BARE_VERSION}" \
+            <<<"$(docker run --rm "${IMAGE_NAME}:ci" --version)"
           echo "image reports v${BARE_VERSION}"
 
           # No -e of any kind: the copy-paste command from the README.
@@ -237,36 +243,40 @@ jobs:
 
           token=""
           for _ in $(seq 1 30); do
-            token="$(docker logs mcp-ci 2>&1 | grep -oP 'Authorization: Bearer \K\S+' | head -1 || true)"
+            docker logs mcp-ci > ctr.log 2>&1 || true
+            token="$(grep -oP 'Authorization: Bearer \K\S+' ctr.log | head -1 || true)"
             [[ -n "${token}" ]] && break
             sleep 1
           done
           if [[ -z "${token}" ]]; then
             echo "the container never printed a generated token"
-            docker logs mcp-ci
+            cat ctr.log
             docker rm -f mcp-ci >/dev/null
             exit 1
           fi
           echo "the container minted a ${#token}-char token and logged it"
 
-          docker logs mcp-ci 2>&1 | grep -q 'UNRESTRICTED'
+          grep -q 'UNRESTRICTED' ctr.log
           echo "image runs unrestricted, as documented"
 
-          # The boot banner carries a paste-ready client config, claudecode by default.
-          docker logs mcp-ci 2>&1 | grep -q 'client:      Claude Code'
-          docker logs mcp-ci 2>&1 | grep -q '"type": "http"'
-          docker run --rm -e MCP_PROVIDER=opencode "${IMAGE_NAME}:ci" --print-config --token \
-            0123456789abcdef0123456789abcdef | grep -q '"type": "remote"'
-          echo "client config printed, MCP_PROVIDER honoured"
+          # The boot banner carries a paste-ready client config, claudecode by
+          # default, with the wildcard bind rendered as an address a client can
+          # actually dial.
+          grep -q 'client:      Claude Code' ctr.log
+          grep -q '"type": "http"' ctr.log
+          grep -q '"url": "http://127.0.0.1:3000/mcp"' ctr.log
+          grep -q 'http://0.0.0.0:3000/mcp' ctr.log
+          echo "client config printed, bound 0.0.0.0 inside the container"
+
+          grep -q '"type": "remote"' <<<"$(docker run --rm -e MCP_PROVIDER=opencode \
+            "${IMAGE_NAME}:ci" --print-config --token 0123456789abcdef0123456789abcdef)"
+          echo "MCP_PROVIDER honoured"
 
           if ! bash scripts/smoke.sh http://127.0.0.1:13000 "${token}"; then
             docker logs mcp-ci
             docker rm -f mcp-ci >/dev/null
             exit 1
           fi
-
-          docker logs mcp-ci 2>&1 | grep -q 'http://0.0.0.0:3000/mcp'
-          echo "bound 0.0.0.0 inside the container"
 
           docker rm -f mcp-ci >/dev/null
           echo "container smoke test passed"
